@@ -1,0 +1,19 @@
+# Dữ liệu nghiệp vụ mẫu và dữ liệu chạy thực tế
+/dataset/
+*.db
+*.db-shm
+*.db-wal
+
+# Build và công cụ
+/node_modules/
+/scaffold/
+/dist/
+/src-tauri/target/
+/.codegraph/
+/.taste-skill/
+/.agents/skills/
+*.log
+
+
+# Release binaries are attached to GitHub Releases, not stored in source history
+/outputs/pr2po-v0.1.0*
