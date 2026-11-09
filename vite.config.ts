@@ -6,20 +6,11 @@ const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(() => ({
+  // Tauri serves embedded assets from its app origin; relative URLs keep production bundles resolvable.
+  base: "./",
   plugins: [react()],
   build: {
-    // AG Grid's isolated chunk is 703 kB uncompressed (198 kB gzip) and loaded locally in Tauri.
     chunkSizeWarningLimit: 750,
-    rolldownOptions: {
-      output: {
-        codeSplitting: {
-          groups: [
-            { name: "ag-grid-react", test: /node_modules[\\/]ag-grid-react[\\/]/, priority: 2, includeDependenciesRecursively: false },
-            { name: "ag-grid-community", test: /node_modules[\\/]ag-grid-community[\\/]/, priority: 1 },
-          ],
-        },
-      },
-    },
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
