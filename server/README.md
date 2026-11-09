@@ -96,9 +96,11 @@ Trang lịch sử hiển thị các version đã công bố. Rollback ở app de
 ## API
 
 - `GET /api/v1/releases`: catalog công khai.
-- `GET /api/v1/manifest/{os}/{arch}/{bundle_type}/{version}`: manifest Tauri (`version`, `notes`, `pub_date`, `url`, `signature`); `latest` chọn release mới nhất.
+- `GET /api/v1/manifest/{target}/{arch}/{bundle_type}/{version}`: manifest Tauri (`version`, `notes`, `pub_date`, `url`, `signature`); `latest` chọn release mới nhất. `bundle_type=unknown` dùng entry generic `{target}-{arch}` làm fallback.
 - `/admin/`: giao diện quản trị.
-- `POST /api/v1/admin/login`, `POST .../logout`, `GET .../releases`, `PUT .../artifacts/...`, `POST .../publish`: API quản trị, không mở CORS và yêu cầu bearer session qua HTTPS.
+- `POST /api/v1/admin/login`, `POST .../logout`, `GET .../releases`, `PUT .../artifacts/...`, `POST .../publish`: API quản trị, yêu cầu HTTPS và bearer session. Upload installer/chữ ký bằng raw bytes, sau đó gọi publish bằng metadata JSON.
+
+Đặc tả endpoint, request mẫu, thứ tự build/upload/publish, xử lý lỗi và checklist xác minh nằm ở [`docs/release-publishing.md`](../docs/release-publishing.md). Hãy dùng tài liệu này làm runbook chuẩn thay vì tự đoán API khi phát hành.
 
 Gói cũ không bị ghi đè. Tauri xác minh chữ ký bằng public key đi cùng app trước khi cài; HTTPS và đăng nhập quản trị bảo vệ luồng tải/công bố. Dịch vụ Python hiện dùng session trong RAM, vì vậy restart sẽ yêu cầu đăng nhập lại. Nên đặt thêm giới hạn truy cập trang admin tại reverse proxy/VPN nếu phù hợp với mạng của tổ chức.
 

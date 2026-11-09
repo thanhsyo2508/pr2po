@@ -5,6 +5,7 @@
 - Rust sở hữu đọc file, kiểm tra dữ liệu, tính tiền, phân bổ và SQLite. React sở hữu hiển thị và tương tác; không đưa toàn bộ file Excel vào JavaScript.
 - Giữ thay đổi nhỏ theo Ponytail nhưng không cắt kiểm tra ở ranh giới nhập dữ liệu, phép tính tiền, phục hồi dữ liệu và khả năng dùng bàn phím.
 - Dữ liệu trong `dataset/` có thể chứa thông tin nghiệp vụ; không đưa vào Git, log, ảnh chụp hay dữ liệu demo công khai.
+- Khi build/phát hành phiên bản, làm theo runbook `docs/release-publishing.md`; không đoán API, không ghi secret vào repo/log/chat, và luôn xác minh catalog, manifest cùng link tải sau publish.
 
 ## CodeGraph
 
