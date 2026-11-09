@@ -13,6 +13,11 @@
 /.taste-skill/
 /.agents/skills/
 *.log
+__pycache__/
+.env
+.env.*
+!.env.example
+/server/data/
 
 
 # Release binaries are attached to GitHub Releases, not stored in source history

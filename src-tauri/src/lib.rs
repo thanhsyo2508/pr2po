@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::{fs::{self, File}, io::Write, path::{Path, PathBuf}, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::Duration};
 use tauri::{Manager, State};
 use tauri::Emitter;
+use tauri_plugin_updater::UpdaterExt;
 use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
@@ -73,6 +74,10 @@ struct QuoteColumnMap {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct QuoteTerms { currency_code: String, exchange_rate_micros: i64, vat_basis_points: i64, freight_total: i64, lead_time_days: i64, minimum_order_quantity: f64 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PdfQuoteRow { page: usize, line_number: usize, item_code: String, quantity: String, unit: String, unit_price: String }
 
 #[derive(Serialize)]
@@ -82,6 +87,10 @@ struct ImportSummary { batch_id: i64, imported: usize, skipped: usize, unchanged
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImportSource { kind: String, id: i64, source_path: String, sheet_name: String, supplier: String, quote_number: String, imported_at: String, row_count: usize }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportProfile { id: i64, name: String, supplier: String, sheet_name: String, first_data_row: usize, mapping: serde_json::Value, updated_at: String }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,15 +114,35 @@ struct ClearSourcesResult { pr_removed: usize, pr_kept_for_history: usize, quote
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Offer { supplier: String, unit_price: i64, quote_line_id: i64 }
+struct Offer { supplier: String, unit_price: i64, effective_unit_price: i64, quote_line_id: i64, currency_code: String, valid_until: String, lead_time_days: i64, minimum_order_quantity: f64, eligible: bool, eligibility_reason: String }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ComparisonRow {
     id: i64, project: String, pr: String, code: String, name: String, spec: String,
     unit: String, quantity: f64, history_price: Option<i64>, offers: Vec<Offer>,
-    suggested_supplier: Option<String>, suggested_price: Option<i64>,
+    suggested_supplier: Option<String>, suggested_price: Option<i64>, suggestion_reason: Option<String>,
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuoteMatchSuggestion { pr_line_id:i64, pr_code:String, pr_name:String, quote_code:String, quote_name:String, supplier:String, unit_price:i64, quote_line_id:i64, confidence:f64, reason:String }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateInfo { current_version:String, version:String, notes:String, date:Option<String> }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkBatchChange { pr_number: String, item_code: String, item_name: String, change_type: String, changed_fields: String, old_quantity: Option<f64>, new_quantity: f64 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkBatchChangeReport { changed: usize, added: usize, total: usize, offset: usize, rows: Vec<WorkBatchChange> }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RfqLine { pr_number: String, item_code: String, item_name: String, spec: String, unit: String, quantity: f64 }
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,6 +163,14 @@ struct PoSummary { id: i64, supplier: String, po_number: String, lines: usize, t
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkBatchSummary { id: i64, name: String, created_at: String, lines: usize, allocated_lines: usize, no_quote_lines: usize, po_count: usize, total_amount: i64 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkBatchVersion { id: i64, version: i64, created_at: String, actor: String, reason: String, allocation_count: usize, scope_count: usize }
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkBatchSnapshot { name: String, allocations: Vec<AllocationInput>, no_quote_pr_ids: Vec<i64>, scope_pr_ids: Vec<i64> }
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -208,11 +245,11 @@ fn db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 fn ensure_work_batch_scope_columns(db:&Connection)->Result<(),String>{
-    for (column,definition) in [("project","TEXT NOT NULL DEFAULT ''"),("pr_number","TEXT NOT NULL DEFAULT ''"),("item_code","TEXT NOT NULL DEFAULT ''"),("item_name","TEXT NOT NULL DEFAULT ''"),("spec","TEXT NOT NULL DEFAULT ''"),("unit","TEXT NOT NULL DEFAULT ''"),("quantity","REAL NOT NULL DEFAULT 0"),("ordered","REAL NOT NULL DEFAULT 0"),("source_row","INTEGER NOT NULL DEFAULT 0")] {
+    for (column,definition) in [("project","TEXT NOT NULL DEFAULT ''"),("pr_number","TEXT NOT NULL DEFAULT ''"),("item_code","TEXT NOT NULL DEFAULT ''"),("item_name","TEXT NOT NULL DEFAULT ''"),("spec","TEXT NOT NULL DEFAULT ''"),("unit","TEXT NOT NULL DEFAULT ''"),("quantity","REAL NOT NULL DEFAULT 0"),("ordered","REAL NOT NULL DEFAULT 0"),("due_date","TEXT NOT NULL DEFAULT ''"),("source_row","INTEGER NOT NULL DEFAULT 0")] {
         let exists:bool=db.prepare("PRAGMA table_info(work_batch_scope)").map_err(|e|e.to_string())?.query_map([],|r|r.get::<_,String>(1)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?.iter().any(|name|name==column);
         if !exists{db.execute(&format!("ALTER TABLE work_batch_scope ADD COLUMN {column} {definition}"),[]).map_err(|e|e.to_string())?;}
     }
-    db.execute("UPDATE work_batch_scope SET project=COALESCE((SELECT project FROM pr_line WHERE id=work_batch_scope.pr_line_id),project),pr_number=COALESCE((SELECT pr_number FROM pr_line WHERE id=work_batch_scope.pr_line_id),pr_number),item_code=COALESCE((SELECT item_code FROM pr_line WHERE id=work_batch_scope.pr_line_id),item_code),item_name=COALESCE((SELECT item_name FROM pr_line WHERE id=work_batch_scope.pr_line_id),item_name),spec=COALESCE((SELECT spec FROM pr_line WHERE id=work_batch_scope.pr_line_id),spec),unit=COALESCE((SELECT unit FROM pr_line WHERE id=work_batch_scope.pr_line_id),unit),quantity=COALESCE((SELECT quantity FROM pr_line WHERE id=work_batch_scope.pr_line_id),quantity),ordered=COALESCE((SELECT ordered FROM pr_line WHERE id=work_batch_scope.pr_line_id),ordered),source_row=COALESCE((SELECT source_row FROM pr_line WHERE id=work_batch_scope.pr_line_id),source_row) WHERE pr_number=''",[]).map_err(|e|e.to_string())?;
+    db.execute("UPDATE work_batch_scope SET project=COALESCE((SELECT project FROM pr_line WHERE id=work_batch_scope.pr_line_id),project),pr_number=COALESCE((SELECT pr_number FROM pr_line WHERE id=work_batch_scope.pr_line_id),pr_number),item_code=COALESCE((SELECT item_code FROM pr_line WHERE id=work_batch_scope.pr_line_id),item_code),item_name=COALESCE((SELECT item_name FROM pr_line WHERE id=work_batch_scope.pr_line_id),item_name),spec=COALESCE((SELECT spec FROM pr_line WHERE id=work_batch_scope.pr_line_id),spec),unit=COALESCE((SELECT unit FROM pr_line WHERE id=work_batch_scope.pr_line_id),unit),quantity=COALESCE((SELECT quantity FROM pr_line WHERE id=work_batch_scope.pr_line_id),quantity),ordered=COALESCE((SELECT ordered FROM pr_line WHERE id=work_batch_scope.pr_line_id),ordered),due_date=COALESCE((SELECT due_date FROM pr_line WHERE id=work_batch_scope.pr_line_id),due_date),source_row=COALESCE((SELECT source_row FROM pr_line WHERE id=work_batch_scope.pr_line_id),source_row) WHERE pr_number=''",[]).map_err(|e|e.to_string())?;
     Ok(())
 }
 
@@ -227,6 +264,10 @@ fn ensure_quote_provenance_columns(db:&Connection)->Result<(),String>{
     if !batch_has_sheet{db.execute("ALTER TABLE quote_batch ADD COLUMN sheet_name TEXT NOT NULL DEFAULT ''",[]).map_err(|e|e.to_string())?;}
     let line_has_page:bool=db.prepare("PRAGMA table_info(quote_line)").map_err(|e|e.to_string())?.query_map([],|r|r.get::<_,String>(1)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?.iter().any(|name|name=="source_page");
     if !line_has_page{db.execute("ALTER TABLE quote_line ADD COLUMN source_page INTEGER NOT NULL DEFAULT 0",[]).map_err(|e|e.to_string())?;}
+    for (column,definition) in [("currency_code","TEXT NOT NULL DEFAULT 'VND'"),("exchange_rate_micros","INTEGER NOT NULL DEFAULT 1000000"),("vat_basis_points","INTEGER NOT NULL DEFAULT 0"),("freight_total","INTEGER NOT NULL DEFAULT 0"),("lead_time_days","INTEGER NOT NULL DEFAULT 0"),("minimum_order_quantity","REAL NOT NULL DEFAULT 0")] {
+        let exists:bool=db.prepare("PRAGMA table_info(quote_batch)").map_err(|e|e.to_string())?.query_map([],|r|r.get::<_,String>(1)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?.iter().any(|name|name==column);
+        if !exists{db.execute(&format!("ALTER TABLE quote_batch ADD COLUMN {column} {definition}"),[]).map_err(|e|e.to_string())?;}
+    }
     Ok(())
 }
 
@@ -263,7 +304,9 @@ fn init_db(path: PathBuf) -> Result<Connection, String> {
          CREATE TABLE IF NOT EXISTS quote_batch (
            id INTEGER PRIMARY KEY, source_path TEXT NOT NULL, file_hash TEXT NOT NULL, supplier TEXT NOT NULL,
            quote_number TEXT NOT NULL DEFAULT '', imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-           row_count INTEGER NOT NULL DEFAULT 0
+            row_count INTEGER NOT NULL DEFAULT 0, currency_code TEXT NOT NULL DEFAULT 'VND', exchange_rate_micros INTEGER NOT NULL DEFAULT 1000000,
+            vat_basis_points INTEGER NOT NULL DEFAULT 0, freight_total INTEGER NOT NULL DEFAULT 0, lead_time_days INTEGER NOT NULL DEFAULT 0,
+            minimum_order_quantity REAL NOT NULL DEFAULT 0
          );
          CREATE INDEX IF NOT EXISTS idx_quote_supplier_hash ON quote_batch(supplier, file_hash);
          CREATE TABLE IF NOT EXISTS quote_line (
@@ -285,10 +328,12 @@ fn init_db(path: PathBuf) -> Result<Connection, String> {
            work_batch_id INTEGER NOT NULL REFERENCES work_batch(id) ON DELETE CASCADE,
            pr_line_id INTEGER NOT NULL, project TEXT NOT NULL DEFAULT '', pr_number TEXT NOT NULL DEFAULT '',
            item_code TEXT NOT NULL DEFAULT '', item_name TEXT NOT NULL DEFAULT '', spec TEXT NOT NULL DEFAULT '', unit TEXT NOT NULL DEFAULT '',
-           quantity REAL NOT NULL DEFAULT 0, ordered REAL NOT NULL DEFAULT 0, source_row INTEGER NOT NULL DEFAULT 0,
+            quantity REAL NOT NULL DEFAULT 0, ordered REAL NOT NULL DEFAULT 0, due_date TEXT NOT NULL DEFAULT '', source_row INTEGER NOT NULL DEFAULT 0,
            PRIMARY KEY(work_batch_id, pr_line_id)
          );
          CREATE TABLE IF NOT EXISTS audit_event (id INTEGER PRIMARY KEY, event_type TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id INTEGER NOT NULL DEFAULT 0, details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+         CREATE TABLE IF NOT EXISTS work_batch_version (id INTEGER PRIMARY KEY, work_batch_id INTEGER NOT NULL REFERENCES work_batch(id) ON DELETE CASCADE, version_no INTEGER NOT NULL, actor TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', snapshot_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(work_batch_id,version_no));
+         CREATE TABLE IF NOT EXISTS quote_code_alias (supplier TEXT NOT NULL, quote_item_code TEXT NOT NULL, pr_item_code TEXT NOT NULL, confidence REAL NOT NULL, accepted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(supplier,quote_item_code));
          CREATE TABLE IF NOT EXISTS recovery_draft (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
          CREATE TABLE IF NOT EXISTS allocation (
            id INTEGER PRIMARY KEY, work_batch_id INTEGER NOT NULL REFERENCES work_batch(id), pr_line_id INTEGER NOT NULL REFERENCES pr_line(id),
@@ -307,9 +352,12 @@ fn init_db(path: PathBuf) -> Result<Connection, String> {
          );
          CREATE INDEX IF NOT EXISTS idx_pr_batch_project ON pr_line(batch_id, project, pr_number);
          CREATE INDEX IF NOT EXISTS idx_pr_batch_pr ON pr_line(batch_id, pr_number);
-         CREATE INDEX IF NOT EXISTS idx_pr_batch_code ON pr_line(batch_id, item_code);"
+         CREATE INDEX IF NOT EXISTS idx_pr_batch_code ON pr_line(batch_id, item_code);
+         CREATE INDEX IF NOT EXISTS idx_pr_batch_pr_code ON pr_line(batch_id,pr_number,item_code);
+         CREATE TABLE IF NOT EXISTS import_profile (id INTEGER PRIMARY KEY,kind TEXT NOT NULL,profile_name TEXT NOT NULL,supplier TEXT NOT NULL DEFAULT '',sheet_name TEXT NOT NULL DEFAULT '',first_data_row INTEGER NOT NULL DEFAULT 1,mapping_json TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,UNIQUE(kind,supplier,profile_name));"
     ).map_err(|e| e.to_string())?;
     ensure_work_batch_scope_columns(&db)?;
+    ensure_work_batch_version_columns(&db)?;
     ensure_allocation_report_columns(&db)?;
     ensure_quote_provenance_columns(&db)?;
     let has_source_path: bool = db.prepare("PRAGMA table_info(purchase_history)").map_err(|e| e.to_string())?
@@ -345,6 +393,27 @@ fn money(text: String) -> Option<i64> {
     if let Ok(value)=text.parse::<f64>(){return Some(value.round() as i64)}
     let digits=text.chars().filter(|c|c.is_ascii_digit()||*c=='-').collect::<String>();
     digits.parse::<i64>().ok()
+}
+
+fn validate_quote_terms(mut terms:QuoteTerms)->Result<QuoteTerms,String>{
+    terms.currency_code=terms.currency_code.trim().to_ascii_uppercase();
+    if !(3..=6).contains(&terms.currency_code.len())||!terms.currency_code.chars().all(|c|c.is_ascii_alphanumeric()){return Err("Mã tiền tệ cần có 3–6 ký tự chữ/số".into())}
+    if terms.exchange_rate_micros<=0||terms.exchange_rate_micros>1_000_000_000_000{return Err("Tỷ giá quy đổi phải lớn hơn 0 và nằm trong giới hạn".into())}
+    if !(0..=100_000).contains(&terms.vat_basis_points){return Err("VAT cần nằm trong khoảng 0–1000%".into())}
+    if terms.freight_total<0||terms.lead_time_days<0||terms.lead_time_days>100_000||!terms.minimum_order_quantity.is_finite()||terms.minimum_order_quantity<0.0||terms.minimum_order_quantity>1_000_000_000.0{return Err("Điều kiện báo giá không hợp lệ".into())}
+    Ok(terms)
+}
+
+fn estimated_landed_price(unit_price:i64,quantity:f64,batch_subtotal:i128,freight_total:i64,exchange_rate_micros:i64,vat_basis_points:i64)->i64{
+    if unit_price<=0{return 0}
+    let quantity_milli=if quantity>0.0{((quantity*1000.0).round() as i128).max(1)}else{1000};
+    let line_subtotal=(unit_price as i128).saturating_mul(quantity_milli).saturating_add(500)/1000;
+    let freight_share=if batch_subtotal>0{(freight_total.max(0) as i128).saturating_mul(line_subtotal)/batch_subtotal}else{0};
+    let freight_per_unit_milli=freight_share.saturating_mul(1000).saturating_mul(1000)/quantity_milli;
+    let unit_milli=(unit_price as i128).saturating_mul(1000).saturating_add(freight_per_unit_milli);
+    let numerator=unit_milli.saturating_mul(exchange_rate_micros.max(1) as i128).saturating_mul(10_000i128.saturating_add(vat_basis_points.max(0) as i128));
+    let denominator=10_000_000_000_000i128;
+    numerator.saturating_add(denominator/2).checked_div(denominator).unwrap_or(i128::MAX).clamp(0,i64::MAX as i128) as i64
 }
 
 fn cell_text(row: &[calamine::Data], index: Option<usize>) -> String {
@@ -438,6 +507,31 @@ fn get_import_sources(state: State<'_, AppState>) -> Result<Vec<ImportSource>, S
         supplier: r.get(4)?, quote_number: r.get(5)?, imported_at: r.get(6)?,
         row_count: r.get::<_, i64>(7)?.max(0) as usize,
     })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_import_profiles(kind:String,supplier:String,state:State<'_,AppState>)->Result<Vec<ImportProfile>,String>{
+    if !["pr","history","quote"].contains(&kind.as_str()){return Err("Loại mẫu import không hợp lệ".into())}
+    let db=state.0.lock().map_err(|_|"Database đang bận")?;
+    let mut stmt=db.prepare("SELECT id,profile_name,supplier,sheet_name,first_data_row,mapping_json,updated_at FROM import_profile WHERE kind=?1 AND (supplier='' OR supplier=?2) ORDER BY CASE WHEN supplier=?2 THEN 0 ELSE 1 END,profile_name COLLATE NOCASE").map_err(|e|e.to_string())?;
+    stmt.query_map(params![kind,supplier.trim()],|r|{let json:String=r.get(5)?;Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?,json,r.get::<_,String>(6)?))}).map_err(|e|e.to_string())?.map(|row|{let (id,name,supplier,sheet_name,first_data_row,json,updated_at)=row.map_err(|e|e.to_string())?;Ok(ImportProfile{id,name,supplier,sheet_name,first_data_row:first_data_row.max(1) as usize,mapping:serde_json::from_str(&json).map_err(|e|e.to_string())?,updated_at})}).collect()
+}
+
+#[tauri::command]
+fn save_import_profile(kind:String,name:String,supplier:String,sheet_name:String,first_data_row:i64,mapping:serde_json::Value,state:State<'_,AppState>)->Result<(),String>{
+    if !["pr","history","quote"].contains(&kind.as_str()){return Err("Loại mẫu import không hợp lệ".into())}
+    let name=name.trim();if name.is_empty()||name.len()>100{return Err("Tên mẫu cần từ 1 đến 100 ký tự".into())}
+    if first_data_row<1||first_data_row>1_000_000{return Err("Dòng dữ liệu đầu tiên không hợp lệ".into())}
+    if !mapping.is_object(){return Err("Ánh xạ cột không hợp lệ".into())}
+    let supplier=if kind=="quote"{supplier.trim()}else{""};let mapping_json=serde_json::to_string(&mapping).map_err(|e|e.to_string())?;
+    let db=state.0.lock().map_err(|_|"Database đang bận")?;
+    db.execute("INSERT INTO import_profile(kind,profile_name,supplier,sheet_name,first_data_row,mapping_json) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(kind,supplier,profile_name) DO UPDATE SET sheet_name=excluded.sheet_name,first_data_row=excluded.first_data_row,mapping_json=excluded.mapping_json,updated_at=CURRENT_TIMESTAMP",params![kind,name,supplier,sheet_name,first_data_row,mapping_json]).map_err(|e|e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_import_profile(id:i64,state:State<'_,AppState>)->Result<(),String>{
+    let db=state.0.lock().map_err(|_|"Database đang bận")?;db.execute("DELETE FROM import_profile WHERE id=?1",[id]).map_err(|e|e.to_string())?;Ok(())
 }
 
 #[tauri::command]
@@ -747,15 +841,16 @@ fn import_history_workbook(path: String, sheet: String, mapping: HistoryColumnMa
 }
 
 #[tauri::command]
-fn import_quote_workbook(path: String, sheet: String, supplier: String, mapping: QuoteColumnMap, app: tauri::AppHandle, job_id: String, state: State<'_, AppState>) -> Result<ImportSummary,String> {
+fn import_quote_workbook(path: String, sheet: String, supplier: String, mapping: QuoteColumnMap, terms: QuoteTerms, app: tauri::AppHandle, job_id: String, state: State<'_, AppState>) -> Result<ImportSummary,String> {
     let (cancel,_job_guard)=begin_import_job(&state,job_id.clone())?;
     let supplier=supplier.trim().to_string(); if supplier.is_empty(){return Err("Nhập tên nhà cung cấp trước khi nhập báo giá".into())}
-    let file_hash=file_hash(&path)?;let hash=format!("{file_hash}:{sheet}:{}:{:?}",mapping.first_data_row,(mapping.code,mapping.name,mapping.spec,mapping.unit,mapping.quantity,mapping.unit_price,mapping.valid_until));let mut workbook=open_workbook_auto(&path).map_err(|e|format!("Không mở được Excel: {e}"))?;
+    let terms=validate_quote_terms(terms)?;
+    let file_hash=file_hash(&path)?;let hash=format!("{file_hash}:{sheet}:{}:{:?}:{}:{}:{}:{}:{}:{}",mapping.first_data_row,(mapping.code,mapping.name,mapping.spec,mapping.unit,mapping.quantity,mapping.unit_price,mapping.valid_until),terms.currency_code,terms.exchange_rate_micros,terms.vat_basis_points,terms.freight_total,terms.lead_time_days,terms.minimum_order_quantity);let mut workbook=open_workbook_auto(&path).map_err(|e|format!("Không mở được Excel: {e}"))?;
     let range=workbook.worksheet_range(&sheet).map_err(|e|format!("Không đọc được sheet: {e}"))?;
     let db=state.0.lock().map_err(|_|"Database đang bận")?;
     if let Some((id,rows))=db.query_row("SELECT id,row_count FROM quote_batch WHERE file_hash=?1 AND supplier=?2",params![hash,supplier],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).optional().map_err(|e|e.to_string())? {return Ok(ImportSummary{batch_id:id,imported:0,skipped:0,unchanged:rows.max(0) as usize})}
     let tx=db.unchecked_transaction().map_err(|e|e.to_string())?;
-    tx.execute("INSERT INTO quote_batch(source_path,file_hash,supplier,quote_number,sheet_name) VALUES (?1,?2,?3,?4,?5)",params![path,hash,supplier,mapping.quote_number.clone().unwrap_or_default(),sheet]).map_err(|e|e.to_string())?;
+    tx.execute("INSERT INTO quote_batch(source_path,file_hash,supplier,quote_number,sheet_name,currency_code,exchange_rate_micros,vat_basis_points,freight_total,lead_time_days,minimum_order_quantity) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![path,hash,supplier,mapping.quote_number.clone().unwrap_or_default(),sheet,terms.currency_code,terms.exchange_rate_micros,terms.vat_basis_points,terms.freight_total,terms.lead_time_days,terms.minimum_order_quantity]).map_err(|e|e.to_string())?;
     let batch_id=tx.last_insert_rowid();
     let mut stmt=tx.prepare_cached("INSERT INTO quote_line(batch_id,source_row,item_code,item_name,spec,unit,quantity,unit_price,valid_until) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)").map_err(|e|e.to_string())?;
     let mut imported=0;let mut skipped=0;
@@ -774,15 +869,16 @@ fn import_quote_workbook(path: String, sheet: String, supplier: String, mapping:
 }
 
 #[tauri::command]
-fn import_quote_pdf(path: String, supplier: String, quote_number: Option<String>, rows: Vec<PdfQuoteRow>, app: tauri::AppHandle, job_id: String, state: State<'_, AppState>) -> Result<ImportSummary,String> {
+fn import_quote_pdf(path: String, supplier: String, quote_number: Option<String>, rows: Vec<PdfQuoteRow>, terms: QuoteTerms, app: tauri::AppHandle, job_id: String, state: State<'_, AppState>) -> Result<ImportSummary,String> {
     let (cancel,_job_guard)=begin_import_job(&state,job_id.clone())?;
     let supplier=supplier.trim().to_string(); if supplier.is_empty(){return Err("Nhập tên nhà cung cấp trước khi nhập báo giá".into())}
     if rows.is_empty(){return Err("PDF không có dòng hàng để nhập".into())}
-    let file_hash=file_hash(&path)?;let hash=format!("{file_hash}:PDF:{}",quote_number.as_deref().unwrap_or_default());
+    let terms=validate_quote_terms(terms)?;
+    let file_hash=file_hash(&path)?;let hash=format!("{file_hash}:PDF:{}:{}:{}:{}:{}:{}:{}",quote_number.as_deref().unwrap_or_default(),terms.currency_code,terms.exchange_rate_micros,terms.vat_basis_points,terms.freight_total,terms.lead_time_days,terms.minimum_order_quantity);
     let db=state.0.lock().map_err(|_|"Database đang bận")?;
     if let Some((id,count))=db.query_row("SELECT id,row_count FROM quote_batch WHERE file_hash=?1 AND supplier=?2",params![hash,supplier],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).optional().map_err(|e|e.to_string())?{return Ok(ImportSummary{batch_id:id,imported:0,skipped:0,unchanged:count.max(0) as usize})}
     let tx=db.unchecked_transaction().map_err(|e|e.to_string())?;
-    tx.execute("INSERT INTO quote_batch(source_path,file_hash,supplier,quote_number,sheet_name) VALUES (?1,?2,?3,?4,'PDF')",params![path,hash,supplier,quote_number.unwrap_or_default()]).map_err(|e|e.to_string())?;
+    tx.execute("INSERT INTO quote_batch(source_path,file_hash,supplier,quote_number,sheet_name,currency_code,exchange_rate_micros,vat_basis_points,freight_total,lead_time_days,minimum_order_quantity) VALUES (?1,?2,?3,?4,'PDF',?5,?6,?7,?8,?9,?10)",params![path,hash,supplier,quote_number.unwrap_or_default(),terms.currency_code,terms.exchange_rate_micros,terms.vat_basis_points,terms.freight_total,terms.lead_time_days,terms.minimum_order_quantity]).map_err(|e|e.to_string())?;
     let batch_id=tx.last_insert_rowid();
     let mut stmt=tx.prepare_cached("INSERT INTO quote_line(batch_id,source_row,source_page,item_code,item_name,spec,unit,quantity,unit_price,valid_until) VALUES (?1,?2,?3,?4,'','',?5,?6,?7,'')").map_err(|e|e.to_string())?;
     let mut imported=0;let mut skipped=0;
@@ -904,25 +1000,81 @@ fn get_supplier_priorities(state: State<'_, AppState>) -> Result<Vec<SupplierPri
 }
 
 #[tauri::command]
-fn get_comparison_rows(pr_ids:Vec<i64>,price_rule:String,state:State<'_,AppState>)->Result<Vec<ComparisonRow>,String>{
+fn get_comparison_rows(pr_ids:Vec<i64>,price_rule:String,use_total_cost:bool,state:State<'_,AppState>)->Result<Vec<ComparisonRow>,String>{
     let db=state.0.lock().map_err(|_|"Database đang bận")?;
+    let today_key=db.query_row("SELECT CAST(strftime('%Y%m%d','now') AS INTEGER)",[],|r|r.get::<_,i32>(0)).map_err(|e|e.to_string())?;
     let mut rules=std::collections::HashMap::<String,i64>::new();
     {let mut s=db.prepare("SELECT supplier,priority FROM supplier_priority").map_err(|e|e.to_string())?;for r in s.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).map_err(|e|e.to_string())?{let (n,p)=r.map_err(|e|e.to_string())?;rules.insert(n,p);}}
     let mut rows=Vec::new();
     let mut base_stmt=db.prepare_cached("SELECT id,project,pr_number,item_code,item_name,spec,unit,quantity FROM pr_line WHERE id=?1").map_err(|e|e.to_string())?;
     let mut history_stmt=db.prepare_cached("SELECT unit_price FROM purchase_history WHERE item_code=?1 AND unit_price>0 ORDER BY id DESC LIMIT 1").map_err(|e|e.to_string())?;
-    let mut offers_stmt=db.prepare_cached("SELECT q.id,b.supplier,q.unit_price FROM quote_line q JOIN quote_batch b ON b.id=q.batch_id WHERE q.item_code=?1 AND q.unit_price>0 AND b.id=(SELECT MAX(b2.id) FROM quote_batch b2 WHERE b2.supplier=b.supplier) ORDER BY b.supplier,q.source_row").map_err(|e|e.to_string())?;
+    let mut offers_stmt=db.prepare_cached("SELECT q.id,b.id,b.supplier,q.unit_price,q.quantity,b.currency_code,b.exchange_rate_micros,b.vat_basis_points,b.freight_total,b.lead_time_days,b.minimum_order_quantity,q.valid_until FROM quote_line q JOIN quote_batch b ON b.id=q.batch_id WHERE (q.item_code=?1 OR EXISTS(SELECT 1 FROM quote_code_alias a WHERE a.supplier=b.supplier AND a.quote_item_code=q.item_code AND a.pr_item_code=?1)) AND q.unit_price>0 AND b.id=(SELECT MAX(b2.id) FROM quote_batch b2 WHERE b2.supplier=b.supplier) ORDER BY b.supplier,q.source_row").map_err(|e|e.to_string())?;
+    let mut batch_total_stmt=db.prepare_cached("SELECT quantity,unit_price FROM quote_line WHERE batch_id=?1").map_err(|e|e.to_string())?;
+    let mut batch_totals=std::collections::HashMap::<i64,i128>::new();
     for id in pr_ids{
         let base=base_stmt.query_row([id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,f64>(7)?))).optional().map_err(|e|e.to_string())?;
         let Some((id,project,pr,code,name,spec,unit,quantity))=base else{continue};
         let history=history_stmt.query_row([&code],|r|r.get::<_,i64>(0)).optional().map_err(|e|e.to_string())?;
         let mut offers=Vec::new();let mut seen=std::collections::HashSet::new();
-        for item in offers_stmt.query_map([&code],|r|Ok(Offer{quote_line_id:r.get(0)?,supplier:r.get(1)?,unit_price:r.get(2)?})).map_err(|e|e.to_string())?{let o=item.map_err(|e|e.to_string())?;if seen.insert(o.supplier.clone()){offers.push(o)}}
-        offers.sort_by(|a,b|match price_rule.as_str(){"max"=>b.unit_price.cmp(&a.unit_price).then_with(||rules.get(&a.supplier).unwrap_or(&100).cmp(rules.get(&b.supplier).unwrap_or(&100))),"priority"=>rules.get(&a.supplier).unwrap_or(&100).cmp(rules.get(&b.supplier).unwrap_or(&100)).then_with(||a.unit_price.cmp(&b.unit_price)),_=>a.unit_price.cmp(&b.unit_price).then_with(||rules.get(&a.supplier).unwrap_or(&100).cmp(rules.get(&b.supplier).unwrap_or(&100)))});
-        let suggested_supplier=offers.first().map(|o|o.supplier.clone());let suggested_price=offers.first().map(|o|o.unit_price);
-        rows.push(ComparisonRow{id,project,pr,code,name,spec,unit,quantity,history_price:history,offers,suggested_supplier,suggested_price});
+        for item in offers_stmt.query_map([&code],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,f64>(4)?,r.get::<_,String>(5)?,r.get::<_,i64>(6)?,r.get::<_,i64>(7)?,r.get::<_,i64>(8)?,r.get::<_,i64>(9)?,r.get::<_,f64>(10)?,r.get::<_,String>(11)?))).map_err(|e|e.to_string())?{
+            let (quote_line_id,batch_id,supplier,unit_price,quote_quantity,currency_code,exchange_rate_micros,vat_basis_points,freight_total,lead_time_days,minimum_order_quantity,valid_until)=item.map_err(|e|e.to_string())?;
+            if !batch_totals.contains_key(&batch_id){let subtotal_rows=batch_total_stmt.query_map([batch_id],|r|Ok((r.get::<_,f64>(0)?,r.get::<_,i64>(1)?))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;let subtotal=subtotal_rows.into_iter().map(|(qty,price)|{let q=if qty>0.0{((qty*1000.0).round() as i128).max(1)}else{1000};(price.max(0) as i128).saturating_mul(q).saturating_add(500)/1000}).sum();batch_totals.insert(batch_id,subtotal);}
+            let batch_subtotal=*batch_totals.get(&batch_id).unwrap_or(&0);
+            if seen.insert(supplier.clone()) {let effective_unit_price=estimated_landed_price(unit_price,quote_quantity,batch_subtotal,freight_total,exchange_rate_micros,vat_basis_points);let expired=report_date_key(&valid_until).is_some_and(|date|date<today_key);let moq_not_met=minimum_order_quantity>quantity+0.000001;let eligible=!expired&&!moq_not_met;let eligibility_reason=if expired{"Báo giá đã quá hạn".to_string()}else if moq_not_met{format!("MOQ {} lớn hơn số lượng cần {}",minimum_order_quantity,quantity)}else{"Đạt điều kiện MOQ và hạn báo giá".to_string()};offers.push(Offer{supplier,unit_price,effective_unit_price,quote_line_id,currency_code,valid_until,lead_time_days,minimum_order_quantity,eligible,eligibility_reason});}
+        }
+        offers.sort_by(|a,b|{let pa=if use_total_cost{a.effective_unit_price}else{a.unit_price};let pb=if use_total_cost{b.effective_unit_price}else{b.unit_price};b.eligible.cmp(&a.eligible).then_with(||match price_rule.as_str(){"max"=>pb.cmp(&pa).then_with(||rules.get(&a.supplier).unwrap_or(&100).cmp(rules.get(&b.supplier).unwrap_or(&100))),"priority"=>rules.get(&a.supplier).unwrap_or(&100).cmp(rules.get(&b.supplier).unwrap_or(&100)).then_with(||a.lead_time_days.cmp(&b.lead_time_days)).then_with(||pa.cmp(&pb)),_=>pa.cmp(&pb).then_with(||a.lead_time_days.cmp(&b.lead_time_days)).then_with(||rules.get(&a.supplier).unwrap_or(&100).cmp(rules.get(&b.supplier).unwrap_or(&100)))} )});
+        let best=offers.iter().find(|offer|offer.eligible);
+        let suggested_supplier=best.map(|o|o.supplier.clone());let suggested_price=best.map(|o|o.unit_price);
+        let suggestion_reason=best.map(|offer|{let criteria=match price_rule.as_str(){"priority"=>format!("NCC ưu tiên #{}",rules.get(&offer.supplier).unwrap_or(&100)),"max"=>"Giá cao nhất trong các báo giá đạt điều kiện".to_string(),_=>"Giá thấp nhất trong các báo giá đạt điều kiện".to_string()};format!("{criteria}; đạt MOQ, giao {} ngày",offer.lead_time_days)});
+        rows.push(ComparisonRow{id,project,pr,code,name,spec,unit,quantity,history_price:history,offers,suggested_supplier,suggested_price,suggestion_reason});
     }
     Ok(rows)
+}
+
+fn normalize_item_code(value:&str)->String{value.chars().filter(|c|c.is_ascii_alphanumeric()).map(|c|c.to_ascii_uppercase()).collect()}
+fn edit_distance(left:&str,right:&str)->usize{
+    let mut previous:Vec<usize>=(0..=right.chars().count()).collect();
+    for (i,a) in left.chars().enumerate(){let mut current=vec![i+1];for (j,b) in right.chars().enumerate(){current.push((current[j]+1).min(previous[j+1]+1).min(previous[j]+usize::from(a!=b)));}previous=current;}
+    *previous.last().unwrap_or(&0)
+}
+
+#[tauri::command]
+fn get_quote_match_suggestions(pr_ids:Vec<i64>,state:State<'_,AppState>)->Result<Vec<QuoteMatchSuggestion>,String>{
+    if pr_ids.len()>5000{return Err("Rà soát ghép mã tối đa 5.000 dòng PR mỗi lượt; hãy chia nhỏ phạm vi.".into())}
+    let db=state.0.lock().map_err(|_|"Database đang bận")?;
+    let mut pr_stmt=db.prepare_cached("SELECT id,item_code,item_name FROM pr_line WHERE id=?1").map_err(|e|e.to_string())?;
+    let mut quote_stmt=db.prepare("SELECT q.id,q.item_code,q.item_name,b.supplier,q.unit_price FROM quote_line q JOIN quote_batch b ON b.id=q.batch_id WHERE q.unit_price>0 AND b.id=(SELECT MAX(b2.id) FROM quote_batch b2 WHERE b2.supplier=b.supplier) AND NOT EXISTS(SELECT 1 FROM quote_code_alias a WHERE a.supplier=b.supplier AND a.quote_item_code=q.item_code) ORDER BY b.supplier,q.source_row LIMIT 200000").map_err(|e|e.to_string())?;
+    let quotes=quote_stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?))).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    let mut by_prefix=std::collections::HashMap::<String,Vec<(i64,String,String,String,i64,String)>>::new();
+    for (id,code,name,supplier,price) in quotes{let normalized=normalize_item_code(&code);if normalized.len()>=2{by_prefix.entry(normalized[..2].to_string()).or_default().push((id,code,name,supplier,price,normalized));}}
+    let mut suggestions=Vec::new();
+    for pr_id in pr_ids{
+        let Some((pr_code,pr_name))=pr_stmt.query_row([pr_id],|r|Ok((r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional().map_err(|e|e.to_string())? else{continue};
+        let normalized=normalize_item_code(&pr_code);if normalized.len()<5{continue}let prefix=normalized[..2].to_string();
+        if by_prefix.get(&prefix).is_some_and(|items|items.iter().any(|item|item.5==normalized)){continue}
+        let mut candidates=Vec::new();
+        for (quote_id,quote_code,quote_name,supplier,price,quote_normalized) in by_prefix.get(&prefix).into_iter().flatten(){
+            if quote_code.eq_ignore_ascii_case(&pr_code)||quote_normalized.len()<5||quote_normalized.len().abs_diff(normalized.len())>3{continue}
+            let distance=edit_distance(&normalized,quote_normalized);let confidence=1.0-distance as f64/normalized.len().max(quote_normalized.len()) as f64;
+            if confidence>=0.72{candidates.push((*quote_id,quote_code.clone(),quote_name.clone(),supplier.clone(),*price,confidence));}
+        }
+        candidates.sort_by(|a,b|b.5.total_cmp(&a.5).then_with(||a.3.cmp(&b.3)));
+        for (quote_id,quote_code,quote_name,supplier,unit_price,confidence) in candidates.into_iter().take(3){
+            let close=confidence>=0.9;let reason=if normalize_item_code(&quote_code)==normalized{"Mã trùng sau khi bỏ dấu phân cách và khác biệt chữ hoa/thường".to_string()}else{format!("Mã gần giống ({:.0}%); cần người mua xác nhận",confidence*100.0)};
+            suggestions.push(QuoteMatchSuggestion{pr_line_id:pr_id,pr_code:pr_code.clone(),pr_name:pr_name.clone(),quote_code,quote_name,supplier,unit_price,quote_line_id:quote_id,confidence,reason:if close{format!("Khớp mạnh. {reason}")}else{reason}});
+        }
+    }
+    Ok(suggestions)
+}
+
+#[tauri::command]
+fn accept_quote_code_match(pr_line_id:i64,quote_line_id:i64,confidence:f64,state:State<'_,AppState>)->Result<(),String>{
+    let db=state.0.lock().map_err(|_|"Database đang bận")?;
+    let (pr_code,quote_code,supplier):(String,String,String)=db.query_row("SELECT p.item_code,q.item_code,b.supplier FROM pr_line p JOIN quote_line q JOIN quote_batch b ON b.id=q.batch_id WHERE p.id=?1 AND q.id=?2",params![pr_line_id,quote_line_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?.ok_or("Không tìm thấy dòng PR hoặc báo giá")?;
+    if normalize_item_code(&pr_code).len()<5||normalize_item_code(&quote_code).len()<5{return Err("Mã hàng quá ngắn để lưu liên kết an toàn".into())}
+    db.execute("INSERT INTO quote_code_alias(supplier,quote_item_code,pr_item_code,confidence) VALUES (?1,?2,?3,?4) ON CONFLICT(supplier,quote_item_code) DO UPDATE SET pr_item_code=excluded.pr_item_code,confidence=excluded.confidence,accepted_at=CURRENT_TIMESTAMP",params![supplier,quote_code,pr_code,confidence.clamp(0.0,1.0)]).map_err(|e|e.to_string())?;
+    db.execute("INSERT INTO audit_event(event_type,entity_type,entity_id,details) VALUES ('match','quote_code_alias',?1,?2)",params![quote_line_id,format!("supplier={supplier}; quote_code={quote_code}; pr_code={pr_code}; confidence={confidence:.3}")]).map_err(|e|e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -945,7 +1097,7 @@ fn save_allocations(name:String,allocations:Vec<AllocationInput>,no_quote_pr_ids
     replace_scope_snapshot(&tx,batch_id,&scope_pr_ids)?;
     let mut stmt=tx.prepare_cached("INSERT INTO allocation(work_batch_id,pr_line_id,supplier,quantity,unit_price,quote_line_id,selection_reason) VALUES (?1,?2,?3,?4,?5,?6,?7)").map_err(|e|e.to_string())?;
     for a in allocations{stmt.execute(params![batch_id,a.pr_line_id,a.supplier.trim(),a.quantity,a.unit_price,a.quote_line_id,a.selection_reason]).map_err(|e|e.to_string())?;}
-    drop(stmt);tx.execute("INSERT INTO audit_event(event_type,entity_type,entity_id,details) VALUES ('save','work_batch',?1,?2)",params![batch_id,format!("allocations={}",tx.query_row("SELECT COUNT(*) FROM allocation WHERE work_batch_id=?1",[batch_id],|r|r.get::<_,i64>(0)).unwrap_or(0))]).map_err(|e|e.to_string())?;tx.commit().map_err(|e|e.to_string())?;Ok(batch_id)
+    drop(stmt);save_work_batch_version(&tx,batch_id,"Tạo đợt xử lý")?;tx.execute("INSERT INTO audit_event(event_type,entity_type,entity_id,details) VALUES ('save','work_batch',?1,?2)",params![batch_id,format!("allocations={}",tx.query_row("SELECT COUNT(*) FROM allocation WHERE work_batch_id=?1",[batch_id],|r|r.get::<_,i64>(0)).unwrap_or(0))]).map_err(|e|e.to_string())?;tx.commit().map_err(|e|e.to_string())?;Ok(batch_id)
 }
 
 #[tauri::command]
@@ -979,6 +1131,28 @@ fn get_work_batch_scope_ids(work_batch_id:i64,state:State<'_,AppState>)->Result<
 }
 
 #[tauri::command]
+fn get_work_batch_changes(work_batch_id:i64,offset:i64,limit:i64,state:State<'_,AppState>)->Result<WorkBatchChangeReport,String>{
+    let db=state.0.lock().map_err(|_|"Database đang bận")?;
+    let cte="WITH active AS (SELECT MAX(id) AS id FROM import_batch WHERE is_active=1), current_pr AS (SELECT p.* FROM pr_line p JOIN active a ON p.batch_id=a.id), changes AS (
+        SELECT s.pr_number,s.item_code,COALESCE(c.item_name,s.item_name),'changed',
+          trim((CASE WHEN s.project<>c.project THEN 'Dự án, ' ELSE '' END)||(CASE WHEN abs(s.quantity-c.quantity)>0.000001 THEN 'Số lượng, ' ELSE '' END)||(CASE WHEN s.item_name<>c.item_name THEN 'Tên hàng, ' ELSE '' END)||(CASE WHEN s.spec<>c.spec THEN 'Quy cách, ' ELSE '' END)||(CASE WHEN s.unit<>c.unit THEN 'ĐVT, ' ELSE '' END)||(CASE WHEN s.due_date<>c.due_date THEN 'Ngày cần, ' ELSE '' END),', '),s.quantity,c.quantity
+        FROM work_batch_scope s JOIN current_pr c ON c.id=(SELECT MAX(c2.id) FROM current_pr c2 WHERE c2.pr_number=s.pr_number AND c2.item_code=s.item_code)
+        WHERE s.work_batch_id=?1 AND (s.project<>c.project OR abs(s.quantity-c.quantity)>0.000001 OR s.item_name<>c.item_name OR s.spec<>c.spec OR s.unit<>c.unit OR s.due_date<>c.due_date)
+        UNION ALL
+        SELECT c.pr_number,c.item_code,c.item_name,'added','Dòng mới trong PR',NULL,c.quantity FROM current_pr c
+        WHERE EXISTS(SELECT 1 FROM work_batch_scope s WHERE s.work_batch_id=?1 AND s.pr_number=c.pr_number)
+          AND NOT EXISTS(SELECT 1 FROM work_batch_scope s WHERE s.work_batch_id=?1 AND s.pr_number=c.pr_number AND s.item_code=c.item_code)
+    ) ";
+    let counts_sql=format!("{cte} SELECT change_type,COUNT(*) FROM changes GROUP BY change_type");
+    let mut changed=0usize;let mut added=0usize;
+    {let mut stmt=db.prepare(&counts_sql).map_err(|e|e.to_string())?;for row in stmt.query_map([work_batch_id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).map_err(|e|e.to_string())?{let (kind,count)=row.map_err(|e|e.to_string())?;if kind=="changed"{changed=count.max(0) as usize}else if kind=="added"{added=count.max(0) as usize}}}
+    let total=changed+added;let rows_sql=format!("{cte} SELECT pr_number,item_code,item_name,change_type,changed_fields,old_quantity,new_quantity FROM changes ORDER BY pr_number,item_code,change_type LIMIT ?2 OFFSET ?3");
+    let mut stmt=db.prepare(&rows_sql).map_err(|e|e.to_string())?;
+    let rows=stmt.query_map(params![work_batch_id,limit.clamp(1,100),offset.max(0)],|r|Ok(WorkBatchChange{pr_number:r.get(0)?,item_code:r.get(1)?,item_name:r.get(2)?,change_type:r.get(3)?,changed_fields:r.get(4)?,old_quantity:r.get(5)?,new_quantity:r.get(6)?})).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    Ok(WorkBatchChangeReport{changed,added,total,offset:offset.max(0) as usize,rows})
+}
+
+#[tauri::command]
 fn update_work_batch(work_batch_id:i64,name:String,allocations:Vec<AllocationInput>,no_quote_pr_ids:Vec<i64>,scope_pr_ids:Vec<i64>,state:State<'_,AppState>)->Result<(),String>{
     if allocations.is_empty(){return Err("Chưa có dòng phân bổ".into())}
     let mut db=state.0.lock().map_err(|_|"Database đang bận")?;
@@ -987,6 +1161,7 @@ fn update_work_batch(work_batch_id:i64,name:String,allocations:Vec<AllocationInp
     for(id,qty)in sums{let requested:f64=db.query_row("SELECT quantity-ordered FROM pr_line WHERE id=?1",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or("Dòng PR không còn tồn tại")?;if qty-requested>0.000001{return Err(format!("Tổng phân bổ vượt số lượng còn lại ở dòng PR #{id}"))}}
     let tx=db.transaction().map_err(|e|e.to_string())?;
     let exists:i64=tx.query_row("SELECT COUNT(*) FROM work_batch WHERE id=?1",[work_batch_id],|r|r.get(0)).map_err(|e|e.to_string())?;if exists==0{return Err("Đợt xử lý không còn tồn tại".into())}
+    save_work_batch_version(&tx,work_batch_id,"Trước khi cập nhật")?;
     tx.execute("UPDATE work_batch SET name=?1 WHERE id=?2",params![name.trim(),work_batch_id]).map_err(|e|e.to_string())?;
     tx.execute("DELETE FROM po_header WHERE work_batch_id=?1",[work_batch_id]).map_err(|e|e.to_string())?;
     tx.execute("DELETE FROM allocation WHERE work_batch_id=?1",[work_batch_id]).map_err(|e|e.to_string())?;
@@ -994,7 +1169,7 @@ fn update_work_batch(work_batch_id:i64,name:String,allocations:Vec<AllocationInp
     replace_scope_snapshot(&tx,work_batch_id,&scope_pr_ids)?;
     let mut stmt=tx.prepare_cached("INSERT INTO allocation(work_batch_id,pr_line_id,supplier,quantity,unit_price,quote_line_id,selection_reason) VALUES (?1,?2,?3,?4,?5,?6,?7)").map_err(|e|e.to_string())?;
     for a in allocations{stmt.execute(params![work_batch_id,a.pr_line_id,a.supplier.trim(),a.quantity,a.unit_price,a.quote_line_id,a.selection_reason]).map_err(|e|e.to_string())?;}
-    drop(stmt);tx.execute("INSERT INTO audit_event(event_type,entity_type,entity_id,details) VALUES ('update','work_batch',?1,?2)",params![work_batch_id,format!("{} allocations saved",tx.query_row("SELECT COUNT(*) FROM allocation WHERE work_batch_id=?1",[work_batch_id],|r|r.get::<_,i64>(0)).unwrap_or(0))]).map_err(|e|e.to_string())?;
+    drop(stmt);save_work_batch_version(&tx,work_batch_id,"Cập nhật phân bổ")?;tx.execute("INSERT INTO audit_event(event_type,entity_type,entity_id,details) VALUES ('update','work_batch',?1,?2)",params![work_batch_id,format!("{} allocations saved",tx.query_row("SELECT COUNT(*) FROM allocation WHERE work_batch_id=?1",[work_batch_id],|r|r.get::<_,i64>(0)).unwrap_or(0))]).map_err(|e|e.to_string())?;
     tx.commit().map_err(|e|e.to_string())
 }
 
@@ -1088,9 +1263,12 @@ fn po_preflight_sql(scoped:bool)->&'static str{if scoped{"SELECT s.pr_line_id,s.
 fn rename_work_batch(work_batch_id: i64, name: String, state: State<'_, AppState>) -> Result<(), String> {
     let clean = name.trim();
     if clean.is_empty() { return Err("Tên đợt không được để trống".into()); }
-    let db = state.0.lock().map_err(|_| "Database đang bận")?;
-    db.execute("UPDATE work_batch SET name=?1 WHERE id=?2", params![clean, work_batch_id]).map_err(|e| e.to_string())?;
-    Ok(())
+    let mut db = state.0.lock().map_err(|_| "Database đang bận")?;
+    let tx=db.transaction().map_err(|e|e.to_string())?;
+    save_work_batch_version(&tx,work_batch_id,"Trước khi đổi tên")?;
+    if tx.execute("UPDATE work_batch SET name=?1 WHERE id=?2", params![clean, work_batch_id]).map_err(|e| e.to_string())?==0{return Err("Không tìm thấy đợt làm việc".into())}
+    save_work_batch_version(&tx,work_batch_id,"Đổi tên đợt")?;
+    tx.commit().map_err(|e|e.to_string())
 }
 
 #[tauri::command]
@@ -1131,9 +1309,84 @@ fn replace_no_quote_snapshot(db:&Connection,work_batch_id:i64,pr_line_ids:&[i64]
 
 fn replace_scope_snapshot(db:&Connection,work_batch_id:i64,pr_line_ids:&[i64])->Result<(),String>{
     db.execute("DELETE FROM work_batch_scope WHERE work_batch_id=?1",[work_batch_id]).map_err(|e|e.to_string())?;
-    let mut stmt=db.prepare_cached("INSERT INTO work_batch_scope(work_batch_id,pr_line_id,project,pr_number,item_code,item_name,spec,unit,quantity,ordered,source_row) SELECT ?1,id,project,pr_number,item_code,item_name,spec,unit,quantity,ordered,source_row FROM pr_line WHERE id=?2").map_err(|e|e.to_string())?;
+    let mut stmt=db.prepare_cached("INSERT INTO work_batch_scope(work_batch_id,pr_line_id,project,pr_number,item_code,item_name,spec,unit,quantity,ordered,due_date,source_row) SELECT ?1,id,project,pr_number,item_code,item_name,spec,unit,quantity,ordered,due_date,source_row FROM pr_line WHERE id=?2").map_err(|e|e.to_string())?;
     for id in pr_line_ids{if stmt.execute(params![work_batch_id,id]).map_err(|e|e.to_string())?==0{return Err(format!("Dòng PR #{id} không còn tồn tại để lưu phạm vi đợt xử lý"))}}
     Ok(())
+}
+
+fn capture_work_batch_snapshot(db:&Connection,work_batch_id:i64)->Result<WorkBatchSnapshot,String>{
+    let name=db.query_row("SELECT name FROM work_batch WHERE id=?1",[work_batch_id],|r|r.get::<_,String>(0)).optional().map_err(|e|e.to_string())?.ok_or("Không tìm thấy đợt làm việc")?;
+    let mut allocations=Vec::new();
+    {let mut stmt=db.prepare("SELECT pr_line_id,supplier,quantity,unit_price,quote_line_id,selection_reason FROM allocation WHERE work_batch_id=?1 ORDER BY id").map_err(|e|e.to_string())?;
+        for row in stmt.query_map([work_batch_id],|r|Ok(AllocationInput{pr_line_id:r.get(0)?,supplier:r.get(1)?,quantity:r.get(2)?,unit_price:r.get(3)?,quote_line_id:r.get(4)?,selection_reason:r.get::<_,Option<String>>(5)?.unwrap_or_default()})).map_err(|e|e.to_string())?{allocations.push(row.map_err(|e|e.to_string())?)} }
+    let no_quote_pr_ids={let mut stmt=db.prepare("SELECT pr_line_id FROM work_batch_no_quote WHERE work_batch_id=?1 ORDER BY pr_line_id").map_err(|e|e.to_string())?;stmt.query_map([work_batch_id],|r|r.get(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<i64>,_>>().map_err(|e|e.to_string())?};
+    let scope_pr_ids={let mut stmt=db.prepare("SELECT pr_line_id FROM work_batch_scope WHERE work_batch_id=?1 ORDER BY pr_line_id").map_err(|e|e.to_string())?;stmt.query_map([work_batch_id],|r|r.get(0)).map_err(|e|e.to_string())?.collect::<Result<Vec<i64>,_>>().map_err(|e|e.to_string())?};
+    Ok(WorkBatchSnapshot{name,allocations,no_quote_pr_ids,scope_pr_ids})
+}
+
+fn ensure_work_batch_version_columns(db:&Connection)->Result<(),String>{
+    let columns=db.prepare("PRAGMA table_info(work_batch_version)").map_err(|e|e.to_string())?.query_map([],|r|r.get::<_,String>(1)).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    if !columns.iter().any(|column|column=="actor"){db.execute("ALTER TABLE work_batch_version ADD COLUMN actor TEXT NOT NULL DEFAULT ''",[]).map_err(|e|e.to_string())?;}
+    Ok(())
+}
+
+fn current_operator()->String{std::env::var("USERNAME").or_else(|_|std::env::var("USER")).unwrap_or_else(|_|"Người dùng cục bộ".into())}
+
+fn save_work_batch_version(db:&Connection,work_batch_id:i64,reason:&str)->Result<(),String>{
+    let snapshot=serde_json::to_string(&capture_work_batch_snapshot(db,work_batch_id)?).map_err(|e|e.to_string())?;
+    db.execute("INSERT INTO work_batch_version(work_batch_id,version_no,actor,reason,snapshot_json) SELECT ?1,COALESCE(MAX(version_no),0)+1,?2,?3,?4 FROM work_batch_version WHERE work_batch_id=?1",params![work_batch_id,current_operator(),reason,snapshot]).map_err(|e|e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_work_batch_versions(work_batch_id:i64,state:State<'_,AppState>)->Result<Vec<WorkBatchVersion>,String>{
+    let db=state.0.lock().map_err(|_|"Database đang bận")?;
+    let mut stmt=db.prepare("SELECT id,version_no,created_at,actor,reason,json_array_length(snapshot_json,'$.allocations'),json_array_length(snapshot_json,'$.scopePrIds') FROM work_batch_version WHERE work_batch_id=?1 ORDER BY version_no DESC LIMIT 50").map_err(|e|e.to_string())?;
+    stmt.query_map([work_batch_id],|r|Ok(WorkBatchVersion{id:r.get(0)?,version:r.get(1)?,created_at:r.get(2)?,actor:r.get(3)?,reason:r.get(4)?,allocation_count:r.get::<_,Option<i64>>(5)?.unwrap_or(0).max(0) as usize,scope_count:r.get::<_,Option<i64>>(6)?.unwrap_or(0).max(0) as usize})).map_err(|e|e.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+}
+
+#[tauri::command]
+fn restore_work_batch_version(work_batch_id:i64,version_id:i64,state:State<'_,AppState>)->Result<(),String>{
+    let mut db=state.0.lock().map_err(|_|"Database đang bận")?;
+    let snapshot_json:String=db.query_row("SELECT snapshot_json FROM work_batch_version WHERE id=?1 AND work_batch_id=?2",params![version_id,work_batch_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or("Không tìm thấy phiên bản")?;
+    let snapshot:WorkBatchSnapshot=serde_json::from_str(&snapshot_json).map_err(|e|e.to_string())?;
+    let mut sums=std::collections::HashMap::<i64,f64>::new();
+    for allocation in &snapshot.allocations{if allocation.supplier.trim().is_empty()||!allocation.quantity.is_finite()||allocation.quantity<=0.0||allocation.unit_price<=0{return Err("Phiên bản lưu có phân bổ không hợp lệ".into())}*sums.entry(allocation.pr_line_id).or_default()+=allocation.quantity;}
+    for(id,quantity)in sums{let remaining:f64=db.query_row("SELECT quantity-ordered FROM pr_line WHERE id=?1",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or("Không thể khôi phục vì một PR trong phiên bản đã bị xóa")?;if quantity-remaining>0.000001{return Err(format!("Không thể khôi phục: tổng phân bổ vượt số lượng còn lại ở PR #{id}"))}}
+    let tx=db.transaction().map_err(|e|e.to_string())?;
+    save_work_batch_version(&tx,work_batch_id,"Trước khi khôi phục")?;
+    tx.execute("UPDATE work_batch SET name=?1 WHERE id=?2",params![snapshot.name,work_batch_id]).map_err(|e|e.to_string())?;
+    tx.execute("DELETE FROM po_header WHERE work_batch_id=?1",[work_batch_id]).map_err(|e|e.to_string())?;
+    tx.execute("DELETE FROM allocation WHERE work_batch_id=?1",[work_batch_id]).map_err(|e|e.to_string())?;
+    replace_no_quote_snapshot(&tx,work_batch_id,&snapshot.no_quote_pr_ids)?;
+    replace_scope_snapshot(&tx,work_batch_id,&snapshot.scope_pr_ids)?;
+    let mut stmt=tx.prepare_cached("INSERT INTO allocation(work_batch_id,pr_line_id,supplier,quantity,unit_price,quote_line_id,selection_reason) VALUES (?1,?2,?3,?4,?5,?6,?7)").map_err(|e|e.to_string())?;
+    for allocation in snapshot.allocations{stmt.execute(params![work_batch_id,allocation.pr_line_id,allocation.supplier.trim(),allocation.quantity,allocation.unit_price,allocation.quote_line_id,allocation.selection_reason]).map_err(|e|e.to_string())?;}
+    drop(stmt);
+    save_work_batch_version(&tx,work_batch_id,"Khôi phục phiên bản")?;
+    tx.execute("INSERT INTO audit_event(event_type,entity_type,entity_id,details) VALUES ('restore','work_batch',?1,?2)",params![work_batch_id,format!("version_id={version_id}")]).map_err(|e|e.to_string())?;
+    tx.commit().map_err(|e|e.to_string())
+}
+
+#[tauri::command]
+fn export_rfq_workbook(path:String,supplier:String,work_name:String,rows:Vec<RfqLine>)->Result<usize,String>{
+    let supplier=supplier.trim();if supplier.is_empty(){return Err("Nhập nhà cung cấp nhận yêu cầu báo giá".into())}
+    if rows.is_empty()||rows.len()>300_000{return Err("Bộ yêu cầu cần có từ 1 đến 300.000 dòng".into())}
+    if rows.iter().any(|r|r.item_code.trim().is_empty()||!r.quantity.is_finite()||r.quantity<=0.0){return Err("Mã hàng và số lượng trong yêu cầu cần hợp lệ".into())}
+    let title=Format::new().set_bold().set_font_size(16).set_font_color(Color::RGB(0x173B44));
+    let subtitle=Format::new().set_font_color(Color::RGB(0x53666A));
+    let header=Format::new().set_bold().set_font_color(Color::White).set_background_color(Color::RGB(0x155761)).set_align(FormatAlign::Center).set_text_wrap().set_border(FormatBorder::Thin);
+    let body=Format::new().set_border(FormatBorder::Thin).set_border_color(Color::RGB(0xE3EAEB));
+    let qty=Format::new().set_num_format("#,##0.###").set_align(FormatAlign::Right).set_border(FormatBorder::Thin).set_border_color(Color::RGB(0xE3EAEB));
+    let mut workbook=Workbook::new();let sheet=workbook.add_worksheet();sheet.set_name("Yeu cau bao gia").map_err(|e|e.to_string())?;
+    sheet.merge_range(0,0,0,9,&format!("YÊU CẦU BÁO GIÁ · {supplier}"),&title).map_err(|e|e.to_string())?;
+    sheet.merge_range(1,0,1,9,&format!("Đợt: {} · Vui lòng điền đơn giá, hạn báo giá và ghi chú.",work_name.trim()),&subtitle).map_err(|e|e.to_string())?;
+    let headers=["STT","Số PR","Mã hàng","Tên hàng","Quy cách","ĐVT","Số lượng yêu cầu","Đơn giá báo","Hạn báo giá","Ghi chú"];
+    for(col,name)in headers.iter().enumerate(){sheet.write_string_with_format(3,col as u16,*name,&header).map_err(|e|e.to_string())?;}
+    for(row,line)in rows.iter().enumerate(){let r=row as u32+4;sheet.write_number_with_format(r,0,(row+1) as f64,&body).map_err(|e|e.to_string())?;sheet.write_string_with_format(r,1,&line.pr_number,&body).map_err(|e|e.to_string())?;sheet.write_string_with_format(r,2,line.item_code.trim(),&body).map_err(|e|e.to_string())?;sheet.write_string_with_format(r,3,&line.item_name,&body).map_err(|e|e.to_string())?;sheet.write_string_with_format(r,4,&line.spec,&body).map_err(|e|e.to_string())?;sheet.write_string_with_format(r,5,&line.unit,&body).map_err(|e|e.to_string())?;sheet.write_number_with_format(r,6,line.quantity,&qty).map_err(|e|e.to_string())?;sheet.write_blank(r,7,&body).map_err(|e|e.to_string())?;sheet.write_blank(r,8,&body).map_err(|e|e.to_string())?;sheet.write_blank(r,9,&body).map_err(|e|e.to_string())?;}
+    for(col,width)in[(0,8.0),(1,24.0),(2,25.0),(3,38.0),(4,30.0),(5,10.0),(6,18.0),(7,20.0),(8,18.0),(9,32.0)]{sheet.set_column_width(col,width).map_err(|e|e.to_string())?;}
+    sheet.set_row_height(0,30.0).map_err(|e|e.to_string())?;sheet.set_row_height(3,34.0).map_err(|e|e.to_string())?;sheet.set_freeze_panes(4,0).map_err(|e|e.to_string())?;sheet.autofilter(3,0,rows.len() as u32+3,9).map_err(|e|e.to_string())?;
+    workbook.save(path).map_err(|e|format!("Không lưu được file yêu cầu báo giá: {e}"))?;Ok(rows.len())
 }
 
 #[tauri::command]
@@ -1255,25 +1508,57 @@ fn restore_database(path:String,app:tauri::AppHandle,state:State<'_,AppState>)->
     let _=fs::remove_file(&temp_db);result
 }
 
+fn updater_for_release(app:&tauri::AppHandle,server_url:&str,target_version:Option<&str>)->Result<tauri_plugin_updater::Updater,String>{
+    let parsed=url::Url::parse(server_url.trim()).map_err(|_|"Địa chỉ máy chủ cập nhật không hợp lệ".to_string())?;
+    if parsed.scheme()!="https"||parsed.host_str().is_none()||!parsed.username().is_empty()||parsed.password().is_some()||parsed.query().is_some()||parsed.fragment().is_some(){return Err("Máy chủ cập nhật phải dùng HTTPS và không chứa tài khoản, query hoặc fragment.".into())}
+    let base=parsed.as_str().trim_end_matches('/');
+    let version=target_version.unwrap_or("latest");
+    if version!="latest"&&(version.len()>40||!version.chars().all(|c|c.is_ascii_alphanumeric()||matches!(c,'.'|'-'|'+'))){return Err("Mã phiên bản cập nhật không hợp lệ".into())}
+    let endpoint=url::Url::parse(&format!("{base}/api/v1/manifest/{{{{target}}}}/{{{{arch}}}}/{{{{bundle_type}}}}/{version}")).map_err(|e|format!("Địa chỉ cập nhật không hợp lệ: {e}"))?;
+    let builder=app.updater_builder().endpoints(vec![endpoint]).map_err(|e|e.to_string())?;
+    builder.pubkey(include_str!("../keys/updater.pub").to_string()).version_comparator(|current,release|release.version!=current).build().map_err(|e|e.to_string())
+}
+
+#[tauri::command]
+fn get_app_version()->String{env!("CARGO_PKG_VERSION").to_string()}
+
+#[tauri::command]
+async fn check_app_update(app:tauri::AppHandle,target_version:Option<String>,server_url:String)->Result<Option<AppUpdateInfo>,String>{
+    let updater=updater_for_release(&app,&server_url,target_version.as_deref())?;
+    let Some(update)=updater.check().await.map_err(|e|format!("Không kiểm tra được cập nhật: {e}"))? else{return Ok(None)};
+    Ok(Some(AppUpdateInfo{current_version:update.current_version,version:update.version,notes:update.body.unwrap_or_default(),date:update.date.map(|date|date.to_string())}))
+}
+
+#[tauri::command]
+async fn install_app_update(app:tauri::AppHandle,target_version:Option<String>,server_url:String)->Result<(),String>{
+    let updater=updater_for_release(&app,&server_url,target_version.as_deref())?;
+    let update=updater.check().await.map_err(|e|format!("Không tải được thông tin phiên bản: {e}"))?.ok_or("Phiên bản đã chọn không còn khả dụng trên máy chủ")?;
+    if target_version.as_ref().is_some_and(|version|version!=&update.version){return Err("Máy chủ trả về phiên bản khác với phiên bản đã chọn; chưa cài đặt.".into())}
+    let progress_app=app.clone();let finish_app=app.clone();
+    update.download_and_install(move|chunk,content_length|{let _=progress_app.emit("pr2po-update-progress",serde_json::json!({"event":"progress","downloaded":chunk,"total":content_length}));},move||{let _=finish_app.emit("pr2po-update-progress",serde_json::json!({"event":"finished"}));}).await.map_err(|e|format!("Không cài được bản cập nhật: {e}"))?;
+    app.restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let path = db_path(&app.handle()).map_err(std::io::Error::other)?;
             let db = init_db(path).map_err(std::io::Error::other)?;
             app.manage(AppState(Mutex::new(db),Mutex::new(std::collections::HashMap::new())));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![preview_workbook, review_workbook, read_pdf_bytes, import_pr_workbook, import_history_workbook, import_quote_workbook, import_quote_pdf, cancel_import, get_import_sources, get_recovery_draft, save_recovery_draft, clear_recovery_draft, get_data_health, get_quote_batch_preview, get_item_history_preview, delete_import_source, get_source_data_cleared, clear_source_data, clear_source_kind, get_pr_page, get_pr_ids, get_pr_projects, get_pr_months, get_suppliers, get_supplier_priorities, set_supplier_priority, get_comparison_rows, save_allocations, update_work_batch, get_work_batches, get_work_batch_allocations, get_work_batch_no_quote_ids, get_work_batch_scope_ids, get_po_summaries, get_po_preflight_review, get_work_report, rename_work_batch, generate_purchase_orders, export_po_workbook, backup_database, restore_database])
+        .invoke_handler(tauri::generate_handler![preview_workbook, review_workbook, read_pdf_bytes, import_pr_workbook, import_history_workbook, import_quote_workbook, import_quote_pdf, cancel_import, get_import_sources, get_import_profiles, save_import_profile, delete_import_profile, get_recovery_draft, save_recovery_draft, clear_recovery_draft, get_data_health, get_quote_batch_preview, get_item_history_preview, delete_import_source, get_source_data_cleared, clear_source_data, clear_source_kind, get_pr_page, get_pr_ids, get_pr_projects, get_pr_months, get_suppliers, get_supplier_priorities, set_supplier_priority, get_comparison_rows, get_quote_match_suggestions, accept_quote_code_match, get_app_version, check_app_update, install_app_update, save_allocations, update_work_batch, get_work_batches, get_work_batch_versions, restore_work_batch_version, get_work_batch_allocations, get_work_batch_no_quote_ids, get_work_batch_scope_ids, get_work_batch_changes, get_po_summaries, get_po_preflight_review, get_work_report, rename_work_batch, generate_purchase_orders, export_rfq_workbook, export_po_workbook, backup_database, restore_database])
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_work_report, display_date_text, ensure_allocation_report_columns, ensure_quote_provenance_columns, ensure_work_batch_scope_columns, format_excel_serial_date, init_db, po_preflight_sql, po_review_issue, project_from_pr, report_date_key, report_price_delta, report_signed_price_delta, PR_PROJECT_EXPR_SQL, stored_project_expr_sql};
+    use super::{build_work_report, display_date_text, ensure_allocation_report_columns, ensure_quote_provenance_columns, ensure_work_batch_scope_columns, estimated_landed_price, format_excel_serial_date, init_db, po_preflight_sql, po_review_issue, project_from_pr, report_date_key, report_price_delta, report_signed_price_delta, PR_PROJECT_EXPR_SQL, stored_project_expr_sql};
 
     #[test]
     fn po_review_flags_missing_and_partial_allocations(){
@@ -1418,5 +1703,11 @@ mod tests {
         assert_eq!(format_excel_serial_date(45_943.5).as_deref(), Some("13/10/2025 12:00"));
         assert_eq!(display_date_text("45943".into()), "13/10/2025");
         assert_eq!(display_date_text("2026-10-01".into()), "01/10/2026");
+    }
+
+    #[test]
+    fn estimates_total_cost_without_changing_the_raw_unit_price() {
+        assert_eq!(estimated_landed_price(100, 1.0, 100, 10, 2_000_000, 1_000), 242);
+        assert_eq!(estimated_landed_price(100, 1.0, 100, 0, 1_000_000, 0), 100);
     }
 }

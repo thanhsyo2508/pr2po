@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Quản lý phát hành · PR2PO</title>
+  <link rel="stylesheet" href="admin.css">
+  <script src="admin.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <a class="brand" href="./"><span class="brand-mark"><i></i><i></i><i></i></span><span>pr<span>2</span>po</span></a>
+      <span class="divider"></span>
+      <div class="page-identity"><span class="eyebrow">QUẢN TRỊ HỆ THỐNG</span><strong>Phát hành phiên bản</strong></div>
+      <div class="top-actions"><span class="secure-pill"><i></i> Gói ký xác thực</span><button id="logout-button" class="button quiet hidden" type="button">Đăng xuất</button></div>
+    </header>
+
+    <main>
+      <section id="https-warning" class="notice notice-warn hidden" role="alert">Trang quản trị chỉ cho đăng nhập qua HTTPS. Hãy mở đường dẫn HTTPS do quản trị viên cung cấp.</section>
+      <section id="login-view" class="login-layout">
+        <div class="login-intro">
+          <span class="eyebrow">PR2PO · RELEASE DESK</span>
+          <h1>Phát hành bản cập nhật<br>có kiểm soát.</h1>
+          <p>Đăng nhập để tải installer đã ký, ghi chú phát hành và đưa phiên bản vào danh mục cập nhật.</p>
+          <div class="login-proof"><span class="proof-icon">✓</span><div><strong>Chữ ký được giữ nguyên</strong><small>App khách xác minh gói bằng khóa công khai trước khi cài.</small></div></div>
+          <div class="login-proof"><span class="proof-icon">↺</span><div><strong>Có thể khôi phục</strong><small>Các phiên bản cũ được giữ lại để người dùng rollback.</small></div></div>
+        </div>
+        <form id="login-form" class="panel login-card">
+          <div class="panel-heading"><span class="eyebrow">KHU VỰC NỘI BỘ</span><h2>Đăng nhập</h2><p>Dùng tài khoản phát hành do quản trị server cấp.</p></div>
+          <label for="username">Tên đăng nhập</label><input id="username" name="username" autocomplete="username" required maxlength="128" placeholder="Tên tài khoản">
+          <label for="password">Mật khẩu</label><input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024" placeholder="Mật khẩu">
+          <button id="login-submit" class="button primary full" type="submit">Đăng nhập <span>→</span></button>
+          <div id="login-message" class="form-message" role="status" aria-live="polite"></div>
+          <small class="security-caption">Phiên đăng nhập chỉ lưu trong bộ nhớ trang và tự hết hạn.</small>
+        </form>
+      </section>
+
+      <section id="dashboard-view" class="dashboard hidden">
+        <div class="welcome-row"><div><span class="eyebrow">RELEASE WORKSPACE</span><h1>Phát hành bản mới</h1><p>Nhập đúng cặp installer và chữ ký `.sig` được tạo cùng lần build.</p></div><div class="signed-badge"><span>✓</span> Xác minh ở máy người dùng</div></div>
+        <div class="workspace-grid">
+          <section class="panel release-panel">
+            <div class="section-heading"><div class="step-number">01</div><div><h2>Thông tin phiên bản</h2><p>Phiên bản đã phát hành là bất biến.</p></div></div>
+            <div class="form-grid">
+              <label class="field"><span>Phiên bản <b>*</b></span><input id="version" placeholder="0.1.3" inputmode="decimal" maxlength="40" required><small>SemVer, ví dụ 0.1.3</small></label>
+              <label class="field"><span>Hệ điều hành</span><select id="target"><option value="windows">Windows</option></select></label>
+              <label class="field"><span>Kiến trúc</span><select id="arch"><option value="x86_64">x64 · x86_64</option></select></label>
+              <label class="field"><span>Gói cài đặt</span><select id="bundle-type"><option value="nsis">NSIS · installer .exe</option><option value="msi">MSI · installer .msi</option></select></label>
+            </div>
+            <label class="field notes-field"><span>Ghi chú phát hành <b>*</b></span><textarea id="notes" rows="4" maxlength="5000" placeholder="Tóm tắt thay đổi người dùng sẽ thấy…"></textarea><small><span id="notes-count">0</span>/5.000 ký tự</small></label>
+
+            <div class="section-heading file-heading"><div class="step-number">02</div><div><h2>Chọn gói đã ký</h2><p>Chọn installer và chữ ký đi kèm.</p></div></div>
+            <div class="upload-grid">
+              <label class="file-drop" for="artifact-file"><span class="file-icon">↑</span><strong>Installer</strong><small id="artifact-hint">Chọn file .exe (NSIS)</small><input id="artifact-file" type="file" accept=".exe,application/vnd.microsoft.portable-executable" required><span id="artifact-name" class="file-name">Chưa chọn tệp</span></label>
+              <label class="file-drop" for="signature-file"><span class="file-icon sig-icon">✳</span><strong>Chữ ký updater</strong><small>Chọn file khớp installer · .sig</small><input id="signature-file" type="file" accept=".sig,text/plain" required><span id="signature-name" class="file-name">Chưa chọn tệp</span></label>
+            </div>
+            <div class="integrity-note"><span>i</span><p>Server không tạo chữ ký thay bạn. Dùng khóa updater riêng của dự án; không upload khóa riêng lên Pi.</p></div>
+            <div id="release-progress" class="progress-area hidden"><div class="progress-copy"><strong id="progress-title">Đang tải gói…</strong><span id="progress-percent">0%</span></div><progress id="progress-bar" max="100" value="0"></progress><small id="progress-detail"></small></div>
+            <div id="publish-message" class="form-message" role="status" aria-live="polite"></div>
+            <div class="publish-footer"><span><i></i> Manifest công khai được cập nhật sau cùng</span><button id="publish-button" class="button primary" type="button">Tải lên và phát hành <span>→</span></button></div>
+          </section>
+
+          <aside class="panel history-panel">
+            <div class="history-title"><div><span class="eyebrow">RELEASE HISTORY</span><h2>Đã phát hành</h2></div><button id="refresh-button" class="icon-button" type="button" aria-label="Làm mới danh sách" title="Làm mới danh sách">↻</button></div>
+            <p class="history-description">Danh mục phiên bản người dùng có thể cập nhật hoặc khôi phục.</p>
+            <div id="release-list" class="release-list"><div class="empty-state">Đang tải danh sách…</div></div>
+            <div class="history-foot"><span class="history-dot"></span> Gói cũ được giữ nguyên</div>
+          </aside>
+        </div>
+      </section>
+    </main>
+    <footer><span>PR2PO Update Service</span><span>Truy cập qua HTTPS · tài khoản phát hành được cấp riêng</span></footer>
+  </div>
+</body>
+</html>

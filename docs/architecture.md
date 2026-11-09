@@ -25,7 +25,7 @@ Ngày: 2026-11-03. Trạng thái: quyết định cho MVP, cần đo hiệu năn
 | Xuất | CSV chuẩn ở MVP; `rust_xlsxwriter` khi có form PO | Tránh phụ thuộc vào tính năng Excel export trả phí của grid. |
 | PDF | PDF.js đọc bảng nhiều trang, hiển thị thành bảng trung gian để người dùng chọn dòng bắt đầu và ánh xạ cột như Excel | Parser hiện nhận diện theo bố cục báo giá mẫu đã thử; PDF scan cần OCR và mẫu khác phải được kiểm chứng trước khi dùng. |
 | Log | `tracing` + log file xoay vòng | Chỉ ghi metadata, lỗi, thời gian xử lý; không ghi nội dung báo giá/PR vào log. |
-| Cập nhật | Tauri Updater ở giai đoạn triển khai nội bộ | Pi sau này có thể chỉ phục vụ gói cập nhật đã ký và manifest tĩnh. |
+| Cập nhật | Tauri Updater với gói ký Minisign, endpoint HTTPS động và rollback theo phiên bản | Pi chỉ phục vụ catalog, manifest và file bất biến; desktop xác minh chữ ký trước khi cài. Cấu hình endpoint/deploy TLS trước khi phát hành cho người dùng. |
 
 **Phương án không chọn lúc này:** TanStack Table + Virtual cho phép kiểm soát markup tối đa nhưng cần tự làm nhiều hành vi grid; Tauri SQL plugin cho frontend làm ranh giới kiểm tra dữ liệu khó quản lý hơn; server trung tâm chưa phục vụ bản standalone.
 
