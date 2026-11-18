@@ -22,3 +22,4 @@ __pycache__/
 
 # Release binaries are attached to GitHub Releases, not stored in source history
 /outputs/pr2po-v0.1.0*
+/outputs/

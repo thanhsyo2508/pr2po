@@ -1,0 +1,7 @@
+.help-illustration{display:block;width:100%;height:auto;margin:8px 0 9px;border-radius:7px;background:#fff}
+.help-steps article>div{min-width:0}
+.help-steps h3{font-size:12px}
+.help-steps p{font-size:11px;line-height:1.55}
+.help-steps article small{font-size:10px;line-height:1.5}
+.help-dialog{width:min(880px,96vw);max-height:calc(100vh - 32px)}
+@media(max-width:650px){.help-dialog{width:min(96vw,560px)}}
